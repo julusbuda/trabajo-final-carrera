@@ -1,1 +1,299 @@
+# Proyecto de implementación de una arquitectura web escalable y altamente disponible en AWS
+## Gestión de Estudiantes — Documentación técnica
+
+**Integrantes:** Johan Stiven Carvajal Chicaiza · Jose Luis Alberto Chamorro Ruales · Brayan Andres Solarte
+**Región:** EE. UU. Este (Ohio) — `us-east-2`  ·  **Cuenta:** 178079050099  ·  **Fecha de implementación:** 4–5 de noviembre de 2026
+
+> Este documento no contiene contraseñas ni claves. La contraseña de la base de datos la generó AWS y vive únicamente en AWS Secrets Manager.
+
+---
+
+## 1. Resumen
+
+Se implementó una aplicación web real de gestión de estudiantes (CRUD completo) desplegada en Amazon EC2 dentro de un Auto Scaling Group detrás de un Application Load Balancer, con IP pública estática (Elastic IP), base de datos relacional Amazon RDS MySQL en subredes privadas, una API serverless (API Gateway + Lambda) que guarda la actividad en DynamoDB, monitoreo con CloudWatch y permisos mínimos con IAM, todo dentro de la VPC `proyecto-vpc`.
+
+**Direcciones de acceso**
+
+| Acceso | URL |
+|---|---|
+| Elastic IP (servidor principal) | http://77.112.239.148 |
+| Application Load Balancer (reparte entre todas las instancias) | http://proyecto-alb-906700274.us-east-2.elb.amazonaws.com |
+| API serverless (API Gateway) | https://s3762fcghc.execute-api.us-east-2.amazonaws.com/eventos |
+
+---
+
+## 2. Arquitectura implementada
+
+```
+                              USUARIO (navegador)
+                                     │ HTTP
+                 ┌───────────────────┴────────────────────┐
+                 ▼                                        ▼
+        Elastic IP 77.112.239.148            Application Load Balancer (proyecto-alb)
+        (servidor principal)                  subredes públicas 2a + 2b
+                 │                                        │
+┌────────────────┼──────────── VPC proyecto-vpc 10.0.0.0/16 ──────────────────────────────┐
+│  Internet Gateway igw-05e773bbc1951ecfb  ◄── proyecto-rtb-public (0.0.0.0/0 → IGW)       │
+│                ▼                                        ▼                                 │
+│  ┌──────── Subred pública 2a ────────┐  ┌──────── Subred pública 2b ────────┐            │
+│  │  EC2 (ASG) t3.micro  Node.js      │  │  EC2 (ASG) t3.micro  Node.js      │  ...max 3  │
+│  └───────────────┬───────────────────┘  └───────────────┬───────────────────┘            │
+│                  │      Auto Scaling Group proyecto-asg (min 1 / deseada 1 / max 3)      │
+│                  │      Política target tracking: CPU promedio 50 %                      │
+│                  ▼ 3306 (solo desde proyecto-sg-web)                                     │
+│  ┌──────── Subred privada 2a ────────┐  ┌──────── Subred privada 2b ────────┐            │
+│  │  RDS MySQL 8.4 proyecto-mysql     │  │  (subnet group de RDS)            │            │
+│  └───────────────────────────────────┘  └───────────────────────────────────┘            │
+│        proyecto-rtb-private (0.0.0.0/0 → NAT Gateway nat-1f0754b46e6bc95bf)              │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  EC2 ──HTTPS──► API Gateway (proyecto-api) ──► Lambda registrar/consultar ──► DynamoDB proyecto-actividad
+  EC2 ──IAM role──► Secrets Manager (credencial RDS) · S3 (paquete de la app)
+  CloudWatch: métricas EC2/ASG/ALB/RDS/Lambda/DynamoDB · 8 alarmas · logs Lambda/API · eventos ASG · dashboard
+```
+
+**Flujo de una operación** (por ejemplo, registrar un estudiante):
+1. El navegador envía `POST /api/estudiantes` a la Elastic IP o al ALB.
+2. La instancia EC2 valida los datos y ejecuta `INSERT` en RDS MySQL (subred privada). La credencial se obtiene de Secrets Manager mediante el rol IAM de la instancia.
+3. La instancia envía el evento a `POST /eventos` de API Gateway → Lambda `proyecto-registrar-evento` → `PutItem` en DynamoDB.
+4. La vista *Actividad* consulta `GET /eventos` → Lambda `proyecto-consultar-eventos` → `Query` en DynamoDB.
+
+---
+
+## 3. Red (VPC)
+
+### 3.1 VPC
+| Recurso | ID | Configuración |
+|---|---|---|
+| VPC `proyecto-vpc` (existente) | vpc-03fd168d9f8d1ff79 | 10.0.0.0/16, DNS habilitado |
+
+### 3.2 Subredes
+| Nombre | ID | CIDR | Zona | Tipo | Tabla de rutas |
+|---|---|---|---|---|---|
+| proyecto-subnet-public1-us-east-2a (existente) | subnet-0acfa392629e282c5 | 10.0.0.0/20 | us-east-2a | Pública | proyecto-rtb-public |
+| proyecto-subnet-public2-us-east-2b (existente) | subnet-083502ae3a296090d | 10.0.16.0/20 | us-east-2b | Pública | proyecto-rtb-public |
+| Private-Subnet-1 (existente) | subnet-0807904ae02972958 | 10.0.32.0/20 | us-east-2a | Privada | proyecto-rtb-private |
+| Private-Subnet-2 (existente) | subnet-03dc7ef89a1a7e59f | 10.0.48.0/20 | us-east-2b | Privada | proyecto-rtb-private |
+
+### 3.3 Puertas de enlace
+| Recurso | ID | Observación |
+|---|---|---|
+| Internet Gateway "proyecto-igw" (existente) | igw-05e773bbc1951ecfb | Asociado a proyecto-vpc. **Ya existía; no se creó otro.** |
+| NAT Gateway (existente) | nat-1f0754b46e6bc95bf | Pública, modo regional, IP 18.217.134.99 (eipalloc-01fa4d0db8dea4193). La etiqueta Name también dice "proyecto-igw", pero es una NAT Gateway. |
+
+### 3.4 Tablas de rutas
+| Nombre | ID | Rutas | Asociaciones |
+|---|---|---|---|
+| proyecto-rtb-public (existente) | rtb-0a54b4dfd2a08f95a | 10.0.0.0/16 → local · 0.0.0.0/0 → igw-05e773bbc1951ecfb | Ambas subredes públicas |
+| **proyecto-rtb-private (nueva)** | rtb-0e0378a4416cd3938 | 10.0.0.0/16 → local · 0.0.0.0/0 → nat-1f0754b46e6bc95bf | Ambas subredes privadas |
+| Principal de la VPC (existente, sin cambios) | rtb-0ec804c0bebb0e524 | 10.0.0.0/16 → local | Ninguna explícita |
+| Tabla de la NAT regional (existente, sin cambios) | rtb-0b200074c96dab288 | 0.0.0.0/0 → IGW | Asociada a la NAT Gateway (la administra AWS) |
+
+### 3.5 Grupos de seguridad (todos nuevos salvo `default`)
+| Nombre | ID | Entrada permitida | Uso |
+|---|---|---|---|
+| proyecto-sg-alb | sg-055e288c9af374691 | TCP 80 desde 0.0.0.0/0 | Application Load Balancer |
+| proyecto-sg-web | sg-064355a3c32a7c83f | TCP 80 desde proyecto-sg-alb · TCP 80 desde 0.0.0.0/0 (acceso por Elastic IP) | Instancias EC2 |
+| proyecto-sg-db | sg-0dcd6695164ce5a0f | TCP 3306 **solo** desde proyecto-sg-web | RDS MySQL |
+| default (existente) | sg-06ddf882efb911c2d | Sin cambios | No se usa |
+
+No hay SSH (22) abierto: la administración de las instancias se hace con **AWS Systems Manager (Session Manager / Run Command)** a través del rol IAM.
+
+---
+
+## 4. Cómputo
+
+### 4.1 Launch Template `proyecto-lt` (lt-03dfc799d006e0d66, versión 1)
+| Parámetro | Valor |
+|---|---|
+| AMI | ami-02dae70ab25064279 — Amazon Linux 2023 (al2023-ami-2023.12.20261102.0, x86_64) |
+| Tipo de instancia | t3.micro (2 vCPU, 1 GiB) |
+| Perfil IAM | proyecto-ec2-profile (rol proyecto-ec2-role) |
+| Red | IP pública automática, SG proyecto-sg-web |
+| Metadatos | IMDSv2 obligatorio; etiquetas de instancia en metadatos habilitadas |
+| User data | `codigo/infra/user-data.sh`: instala Node.js 22, descarga la app desde S3, crea el servicio systemd `gestion-estudiantes` (puerto 80, usuario sin privilegios `appuser`) y asocia la Elastic IP si está libre |
+
+### 4.2 Auto Scaling Group `proyecto-asg`
+| Parámetro | Valor |
+|---|---|
+| Capacidad mínima / deseada / máxima | 1 / 1 / 3 |
+| Subredes | Públicas us-east-2a y us-east-2b |
+| Target group | proyecto-tg |
+| Health check | ELB, período de gracia 300 s, calentamiento de instancia 120 s |
+| Política | `proyecto-cpu-50` — Target tracking, CPU promedio del grupo = 50 % |
+| Métricas del grupo | Habilitadas (granularidad 1 minuto) |
+| Protección de escalado | La instancia que tiene la Elastic IP se marca *protected from scale-in*, para que el escalado hacia abajo no la elimine |
+
+### 4.3 Application Load Balancer
+| Recurso | Valor |
+|---|---|
+| ALB `proyecto-alb` | Internet-facing, subredes públicas 2a/2b, SG proyecto-sg-alb, DNS proyecto-alb-906700274.us-east-2.elb.amazonaws.com |
+| Listener | HTTP :80 → forward a proyecto-tg |
+| Target group `proyecto-tg` | HTTP :80, health check `GET /health` cada 15 s (2 OK = sano, 3 fallos = no sano), deregistration delay 30 s |
+
+### 4.4 Elastic IP
+| Recurso | Valor |
+|---|---|
+| proyecto-eip-web | 77.112.239.148 (eipalloc-0b7142541185113d7) |
+| Asociación | La instancia principal del ASG la toma al arrancar (si la instancia que la tenía deja de existir, la siguiente que arranque la toma). Está asociada y en uso. |
+
+**Nota sobre Elastic IP y Auto Scaling:** una Elastic IP solo puede apuntar a una instancia. Por eso la IP estática da acceso al servidor principal, que es lo que pide el documento, y el ALB distribuye el tráfico entre todas las instancias del grupo. Así se demuestra la alta disponibilidad.
+
+---
+
+## 5. Base de datos relacional — Amazon RDS MySQL
+
+| Parámetro | Valor |
+|---|---|
+| Identificador | proyecto-mysql |
+| Motor | MySQL Community 8.4.11 |
+| Clase | db.t4g.micro (2 vCPU Graviton, 1 GiB) |
+| Almacenamiento | 20 GiB gp3, cifrado en reposo |
+| Disponibilidad | Single-AZ (us-east-2a), por costo académico |
+| Subnet group | proyecto-db-subnets (Private-Subnet-1 y Private-Subnet-2) |
+| Acceso público | **No** (resuelve a 10.0.42.32, IP privada) |
+| Security group | proyecto-sg-db (3306 solo desde proyecto-sg-web) |
+| Usuario maestro | admin — contraseña **administrada por AWS** en Secrets Manager (`rds!db-22d41462-…`), con rotación automática |
+| Copias de seguridad | Retención 1 día |
+| Endpoint | proyecto-mysql.clsgmkssw8lo.us-east-2.rds.amazonaws.com:3306 |
+| Base de datos | `estudiantes` |
+
+**Esquema** (la aplicación lo crea al iniciar si no existe):
+
+```sql
+CREATE TABLE estudiantes (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  nombre VARCHAR(120) NOT NULL,
+  carrera VARCHAR(120) NOT NULL,
+  semestre TINYINT UNSIGNED NOT NULL,          -- 1 a 12
+  correo VARCHAR(150) NULL,
+  estado ENUM('Activo','Inactivo') NOT NULL DEFAULT 'Activo',
+  creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  actualizado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_carrera (carrera)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+La conexión usa TLS. Si RDS rota la contraseña, la aplicación detecta el error de autenticación, vuelve a leer el secreto y reconecta.
+
+---
+
+## 6. Amazon Aurora — análisis (no desplegado)
+
+El documento pide "analizar e implementar Aurora como alternativa". Se analizó y **no se desplegó** para no generar costos adicionales sin autorización; RDS MySQL ya cubre la función de base de datos relacional del proyecto.
+
+| Aspecto | Amazon RDS MySQL (implementado) | Amazon Aurora MySQL |
+|---|---|---|
+| Arquitectura de almacenamiento | Volumen EBS adjunto a la instancia | Volumen distribuido compartido, 6 copias en 3 zonas de disponibilidad |
+| Crecimiento de almacenamiento | Se aprovisiona (20 GiB) y se amplía manualmente o con autoscaling de almacenamiento | Crece automáticamente en bloques de 10 GiB hasta 128 TiB |
+| Alta disponibilidad | Multi-AZ opcional (instancia standby, failover de 60–120 s) | Hasta 15 réplicas de lectura; failover típico < 30 s |
+| Réplicas de lectura | Hasta 15, replicación asíncrona | Hasta 15 con retraso de milisegundos (comparten almacenamiento) |
+| Rendimiento | El de MySQL estándar | AWS lo anuncia hasta 5× MySQL estándar |
+| Modo serverless | No | Aurora Serverless v2 (escala por ACU; puede pausarse a 0 ACU) |
+| Instancia mínima | db.t4g.micro (apta para Free Tier) | db.t4g.medium (aprovisionado) o 0,5 ACU (Serverless v2) |
+| Costo aproximado en us-east-2 | ~0,016 USD/h + 0,115 USD/GB-mes | db.t4g.medium ~0,073 USD/h · Serverless v2 ~0,12 USD por ACU-hora + almacenamiento 0,10 USD/GB-mes + E/S |
+| Compatibilidad con la app | Total | Total (compatible con MySQL 8; solo cambia el endpoint) |
+
+**Conclusión:** para la carga académica del proyecto, RDS MySQL `db.t4g.micro` ofrece el mejor costo. Aurora sería la opción en producción, cuando se necesite failover rápido, réplicas de baja latencia o escalado automático de la capacidad de cómputo.
+
+**Migración posible:** como la app solo depende del endpoint MySQL, se puede cambiar a Aurora así:
+1. Crear una réplica de lectura Aurora a partir de `proyecto-mysql`, o restaurar una instantánea en Aurora MySQL.
+2. Promoverla.
+3. Cambiar `DB_HOST` y `DB_SECRET_ARN` en el user data del Launch Template.
+
+Si se quiere hacer una demostración en vivo, Aurora Serverless v2 con mínimo 0 ACU (pausa automática) cuesta poco mientras está pausado, pero cobra almacenamiento y E/S. Requiere autorización previa.
+
+---
+
+## 7. Serverless — Lambda, API Gateway y DynamoDB
+
+### 7.1 DynamoDB
+| Parámetro | Valor |
+|---|---|
+| Tabla | proyecto-actividad |
+| Clave de partición | `tipo` (String). Todos los eventos usan `EVENTO` |
+| Clave de ordenamiento | `fecha` (String, ISO-8601 + sufijo aleatorio) |
+| Modo de capacidad | On-demand (PAY_PER_REQUEST) |
+| Atributos | accion, estudianteId, detalle, origen (ID de la instancia EC2), requestId |
+
+### 7.2 Funciones Lambda (Python 3.12, 128 MB, timeout 10 s)
+| Función | Propósito | Disparador | Permisos |
+|---|---|---|---|
+| proyecto-registrar-evento | Valida la acción (CREAR/ACTUALIZAR/ELIMINAR/CONSULTAR/PRUEBA) y guarda el evento en DynamoDB | API Gateway `POST /eventos` | proyecto-lambda-role |
+| proyecto-consultar-eventos | Devuelve los últimos N eventos (máximo 100), del más reciente al más antiguo | API Gateway `GET /eventos?limite=N` | proyecto-lambda-role |
+
+Logs: `/aws/lambda/proyecto-registrar-evento` y `/aws/lambda/proyecto-consultar-eventos` (retención de 14 días).
+
+### 7.3 API Gateway — `proyecto-api` (API HTTP, ID s3762fcghc)
+| Método y ruta | Integración | Respuesta |
+|---|---|---|
+| `POST /eventos` | Lambda proxy → proyecto-registrar-evento | 201 con el ítem guardado · 400 si la acción no es válida |
+| `GET /eventos?limite=N` | Lambda proxy → proyecto-consultar-eventos | 200 con `{total, eventos[]}` |
+| Otras rutas | — | 404 |
+
+- Etapa `$default` con auto-deploy y **límite de 10 solicitudes/s (ráfaga de 20)**, para controlar costos.
+- CORS habilitado (GET y POST).
+- Logs de acceso en `/aws/apigateway/proyecto-api`.
+- URL base: `https://s3762fcghc.execute-api.us-east-2.amazonaws.com`
+
+Ejemplo:
+```bash
+curl -X POST https://s3762fcghc.execute-api.us-east-2.amazonaws.com/eventos \
+  -H 'content-type: application/json' -d '{"accion":"PRUEBA","detalle":"demo","origen":"curl"}'
+curl "https://s3762fcghc.execute-api.us-east-2.amazonaws.com/eventos?limite=5"
+```
+
+---
+
+## 8. Monitoreo — Amazon CloudWatch
+
+| Elemento | Detalle |
+|---|---|
+| Dashboard `proyecto-dashboard` | CPU EC2 (promedio del ASG, con línea del objetivo 50 %), instancias del ASG (InService, deseada, máxima), solicitudes del ALB y hosts sanos, invocaciones y errores de Lambda, CPU y conexiones de RDS, consumo de DynamoDB, estado de alarmas y tabla de eventos de Auto Scaling |
+| Alarma `proyecto-cpu-alta` | CPU promedio del ASG > 70 % durante 2 × 5 min |
+| Alarma `proyecto-estado-instancias` | StatusCheckFailed ≥ 1 en el ASG |
+| Alarma `proyecto-alb-hosts-no-saludables` | UnHealthyHostCount ≥ 1 durante 3 min |
+| Alarma `proyecto-rds-cpu-alta` | CPU de RDS > 80 % durante 2 × 5 min |
+| Alarmas `proyecto-registrar-evento-errores` / `proyecto-consultar-eventos-errores` | Errors ≥ 1 en 5 min |
+| Alarmas de target tracking (creadas por Auto Scaling) | AlarmHigh (escalar hacia arriba) y AlarmLow (escalar hacia abajo) |
+| Eventos | Regla de EventBridge `proyecto-eventos-autoscaling` → log group `/aws/events/proyecto-autoscaling` (lanzamientos y terminaciones de instancias) |
+| Logs | Lambda, accesos de API Gateway, eventos de ASG (todos con retención de 14 días) |
+
+Las 8 alarmas caben en las 10 alarmas gratuitas de CloudWatch. Las alarmas no envían correo; si se quieren notificaciones, se puede crear un tema SNS y suscribir un correo, lo que requiere confirmarlo desde ese correo.
+
+---
+
+## 9. Seguridad — IAM y otras medidas
+
+### 9.1 Roles IAM creados (permisos mínimos)
+| Rol | Confía en | Permisos |
+|---|---|---|
+| proyecto-ec2-role (perfil proyecto-ec2-profile) | ec2.amazonaws.com | `AmazonSSMManagedInstanceCore` (administración sin SSH) + política en línea `proyecto-ec2-minimo`: `secretsmanager:GetSecretValue` **solo** sobre el secreto de RDS; `s3:GetObject` **solo** sobre `proyecto-gestion-estudiantes-178079050099/app/*`; `ec2:AssociateAddress`, `ec2:DescribeAddresses`, `ec2:DescribeInstanceStatus` (Elastic IP); `autoscaling:SetInstanceProtection` **solo** sobre proyecto-asg |
+| proyecto-lambda-role | lambda.amazonaws.com | `AWSLambdaBasicExecutionRole` (logs) + política en línea `proyecto-lambda-dynamodb`: `dynamodb:PutItem`, `Query`, `GetItem` **solo** sobre la tabla proyecto-actividad |
+
+Roles vinculados a servicios que AWS creó automáticamente: AWSServiceRoleForAutoScaling, ElasticLoadBalancing, RDS y APIGateway.
+
+### 9.2 Otras medidas
+- No hay credenciales en el código: la app usa el rol de la instancia, y la contraseña de RDS está en Secrets Manager y se rota automáticamente.
+- RDS está en subredes privadas, sin acceso público, con el puerto 3306 abierto solo desde el SG web, y cifrado en reposo y en tránsito (TLS).
+- Las instancias no tienen SSH abierto, exigen IMDSv2 y ejecutan la app con el usuario sin privilegios `appuser` (solo con la capacidad de abrir el puerto 80).
+- El bucket S3 es privado (Block Public Access activado en sus 4 opciones).
+- La API está limitada a 10 solicitudes/s y valida las entradas en Lambda y en el servidor.
+- La aplicación valida los datos (longitudes, rango de semestre, formato de correo), usa consultas parametrizadas contra inyección SQL y escapa el HTML en el cliente contra XSS.
+- **Recomendación:** la consola se está usando con el **usuario root**. Para el trabajo diario conviene crear un usuario IAM administrador con MFA y guardar el root solo para emergencias.
+
+---
+
+## 10. Aplicación web
+
+| Aspecto | Detalle |
+|---|---|
+| Nombre | GESTIÓN DE ESTUDIANTES |
+| Backend | Node.js 22 + Express 4, mysql2, AWS SDK v3 (Secrets Manager) |
+| Frontend | HTML, CSS y JavaScript sin frameworks (SPA con enrutamiento por hash); diseño institucional inspirado en portales universitarios: granate #A51C30, blanco, grises, tipografía serif para títulos, iconografía SVG propia y diseño adaptable a móvil |
+| Vistas | Inicio (dashboard con indicadores), Registro, Estudiantes (listado con búsqueda y filtro por carrera), Consulta por ID, Ficha, Edición, Eliminación con confirmación, Estadísticas (por carrera y por semestre), Actividad (DynamoDB vía API Gateway) y Servicios AWS (estado en vivo de EC2, ASG, RDS, API Gateway, Lambda y DynamoDB) |
+| API REST propia | `GET/POST /api/estudiantes`, `GET/PUT/DELETE /api/estudiantes/:id`, `GET /api/estadisticas`, `GET /api/actividad`, `GET /api/info`, `GET /health` |
+| Despliegue | El paquete `gestion-estudiantes.tgz` está en S3 (`s3://proyecto-gestion-estudiantes-178079050099/app/`); cada instancia lo descarga al arrancar |
+
+El código fuente completo está en la carpeta `codigo/`.
 
